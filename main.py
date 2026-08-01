@@ -1,8 +1,9 @@
 import aiohttp
 import asyncio
 import json
+import random
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union, Callable, TypeVar, Generic
+from typing import List, Dict, Any, Optional, Union, Callable, TypeVar, Generic, Tuple
 import logging
 from dataclasses import dataclass, field
 
@@ -15,22 +16,26 @@ class APIError(Exception):
     pass
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60, half_open_limit: int = 3):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
+        self.half_open_limit = half_open_limit
         self.failure_count = 0
         self.last_failure_time = None
         self.state = 'CLOSED'
+        self.half_open_requests = 0
     
     def record_failure(self):
         self.failure_count += 1
         self.last_failure_time = datetime.now()
         if self.failure_count >= self.failure_threshold:
             self.state = 'OPEN'
+            self.half_open_requests = 0
     
     def record_success(self):
         self.failure_count = 0
         self.state = 'CLOSED'
+        self.half_open_requests = 0
     
     def can_request(self) -> bool:
         if self.state == 'CLOSED':
@@ -40,10 +45,14 @@ class CircuitBreaker:
                 time_since_failure = (datetime.now() - self.last_failure_time).total_seconds()
                 if time_since_failure > self.recovery_timeout:
                     self.state = 'HALF_OPEN'
+                    self.half_open_requests = 0
                     return True
             return False
         elif self.state == 'HALF_OPEN':
-            return True
+            if self.half_open_requests < self.half_open_limit:
+                self.half_open_requests += 1
+                return True
+            return False
         return False
 
 class MetricsCollector:
@@ -51,10 +60,13 @@ class MetricsCollector:
         self.request_count = 0
         self.error_count = 0
         self.request_durations = []
+        self.status_code_counts: Dict[int, int] = {}
     
-    def record_request(self, duration: float):
+    def record_request(self, duration: float, status_code: int = None):
         self.request_count += 1
         self.request_durations.append(duration)
+        if status_code is not None:
+            self.status_code_counts[status_code] = self.status_code_counts.get(status_code, 0) + 1
     
     def record_error(self):
         self.error_count += 1
@@ -68,6 +80,9 @@ class MetricsCollector:
         if self.request_count == 0:
             return 1.0
         return (self.request_count - self.error_count) / self.request_count
+    
+    def get_status_code_distribution(self) -> Dict[int, int]:
+        return self.status_code_counts.copy()
 
 @dataclass
 class ClientConfig:
@@ -75,6 +90,8 @@ class ClientConfig:
     max_retries: int = 3
     timeout: int = 10
     rate_limit: Optional[int] = None
+    max_connections: int = 100
+    max_connections_per_host: int = 20
     headers: Dict[str, str] = field(default_factory=lambda: {'User-Agent': 'AsyncAPIClient/1.0'})
     circuit_breaker_threshold: int = 5
     circuit_breaker_timeout: int = 60
@@ -112,9 +129,14 @@ class AsyncAPIClient(Generic[T]):
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None:
             timeout_settings = aiohttp.ClientTimeout(total=self.timeout)
+            connector = aiohttp.TCPConnector(
+                limit=self.config.max_connections,
+                limit_per_host=self.config.max_connections_per_host
+            )
             self.session = aiohttp.ClientSession(
                 timeout=timeout_settings,
-                headers=self.config.headers
+                headers=self.config.headers,
+                connector=connector
             )
             self._owns_session = True
         return self.session
@@ -125,24 +147,39 @@ class AsyncAPIClient(Generic[T]):
             self.session = None
             self._owns_session = False
     
-    async def _apply_request_interceptors(self, url: str, kwargs: Dict) -> tuple:
+    async def _apply_request_interceptors(self, url: str, kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         for interceptor in self._request_interceptors:
-            url, kwargs = await interceptor(url, kwargs) if asyncio.iscoroutinefunction(interceptor) else interceptor(url, kwargs)
+            if asyncio.iscoroutinefunction(interceptor):
+                url, kwargs = await interceptor(url, kwargs)
+            else:
+                url, kwargs = interceptor(url, kwargs)
         return url, kwargs
     
     async def _apply_response_interceptors(self, response: Any) -> Any:
         for interceptor in self._response_interceptors:
-            response = await interceptor(response) if asyncio.iscoroutinefunction(interceptor) else interceptor(response)
+            if asyncio.iscoroutinefunction(interceptor):
+                response = await interceptor(response)
+            else:
+                response = interceptor(response)
         return response
     
-    async def fetch_with_retry(self, url: str, method: str = 'GET', expected_type: Optional[type] = None, **kwargs) -> Union[Dict[str, Any], List[Any]]:
+    async def health_check(self) -> bool:
+        try:
+            await self.fetch_with_retry(self.base_url, method='HEAD')
+            return True
+        except APIError:
+            return False
+    
+    async def fetch_with_retry(self, url: str, method: str = 'GET', expected_type: Optional[type] = None, **kwargs) -> Any:
         if not self.circuit_breaker.can_request():
             raise APIError("Circuit breaker is OPEN")
         
         start_time = datetime.now()
+        acquired = False
         
         if self._semaphore:
             await self._semaphore.acquire()
+            acquired = True
         
         try:
             session = await self._get_session()
@@ -151,38 +188,49 @@ class AsyncAPIClient(Generic[T]):
             for attempt in range(self.max_retries):
                 try:
                     async with session.request(method, url, **kwargs) as response:
-                        if response.status == 200:
-                            try:
-                                result = await response.json()
-                                if expected_type and not isinstance(result, expected_type):
-                                    raise APIError(f"Expected {expected_type}, got {type(result)}")
-                                result = await self._apply_response_interceptors(result)
-                                self.circuit_breaker.record_success()
-                                duration = (datetime.now() - start_time).total_seconds()
-                                self.metrics.record_request(duration)
-                                return result
-                            except json.JSONDecodeError as e:
-                                error_msg = f"JSON decode error: {e}"
-                                logger.error(error_msg)
-                                if attempt == self.max_retries - 1:
-                                    self.circuit_breaker.record_failure()
-                                    self.metrics.record_error()
-                                    raise APIError(error_msg)
-                        elif response.status >= 500:
+                        status_code = response.status
+                        
+                        if 200 <= status_code < 300:
+                            content_type = response.headers.get('Content-Type', '')
+                            if 'application/json' in content_type:
+                                try:
+                                    result = await response.json()
+                                except json.JSONDecodeError as e:
+                                    error_msg = f"JSON decode error: {e}"
+                                    logger.error(error_msg)
+                                    if attempt == self.max_retries - 1:
+                                        self.circuit_breaker.record_failure()
+                                        self.metrics.record_error()
+                                        raise APIError(error_msg)
+                                    continue
+                            else:
+                                result = await response.text()
+                            
+                            if expected_type and not isinstance(result, expected_type):
+                                logger.warning(f"Expected {expected_type}, got {type(result)}")
+                            
+                            result = await self._apply_response_interceptors(result)
+                            self.circuit_breaker.record_success()
+                            duration = (datetime.now() - start_time).total_seconds()
+                            self.metrics.record_request(duration, status_code)
+                            return result
+                        elif status_code >= 500:
                             if attempt < self.max_retries - 1:
-                                wait_time = 2 ** attempt
-                                logger.warning(f"Server error {response.status}, retrying in {wait_time}s...")
+                                wait_time = (2 ** attempt) + random.uniform(0, 0.5)
+                                logger.warning(f"Server error {status_code}, retrying in {wait_time:.2f}s...")
                                 await asyncio.sleep(wait_time)
                                 continue
                             else:
                                 self.circuit_breaker.record_failure()
                                 self.metrics.record_error()
-                                raise APIError(f"Server error {response.status} after {self.max_retries} attempts")
+                                self.metrics.record_request((datetime.now() - start_time).total_seconds(), status_code)
+                                raise APIError(f"Server error {status_code} after {self.max_retries} attempts")
                         else:
                             error_text = await response.text()
                             self.circuit_breaker.record_failure()
                             self.metrics.record_error()
-                            raise APIError(f"Client error {response.status}: {error_text[:200]}")
+                            self.metrics.record_request((datetime.now() - start_time).total_seconds(), status_code)
+                            raise APIError(f"Client error {status_code}: {error_text[:200]}")
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
                     if attempt < self.max_retries - 1:
@@ -202,10 +250,10 @@ class AsyncAPIClient(Generic[T]):
             
             raise APIError(f"Unknown error fetching {url}")
         finally:
-            if self._semaphore:
+            if self._semaphore and acquired:
                 self._semaphore.release()
     
-    async def fetch_multiple(self, endpoints: List[str], method: str = 'GET', **kwargs) -> List[Any]:
+    async def fetch_multiple(self, endpoints: List[str], method: str = 'GET', **kwargs) -> List[Optional[Any]]:
         urls = [f"{self.base_url}/{endpoint.lstrip('/')}" for endpoint in endpoints]
         tasks = [self.fetch_with_retry(url, method, **kwargs) for url in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -222,19 +270,23 @@ class AsyncAPIClient(Generic[T]):
     
     async def create_resource(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        result = await self.fetch_with_retry(url, method='POST', expected_type=dict, json=data)
+        result = await self.fetch_with_retry(url, method='POST', json=data)
+        if not isinstance(result, dict):
+            raise APIError(f"Expected dict, got {type(result)}")
         return result
     
     async def update_resource(self, endpoint: str, resource_id: Union[int, str], data: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/{endpoint.lstrip('/')}/{resource_id}"
-        result = await self.fetch_with_retry(url, method='PUT', expected_type=dict, json=data)
+        result = await self.fetch_with_retry(url, method='PUT', json=data)
+        if not isinstance(result, dict):
+            raise APIError(f"Expected dict, got {type(result)}")
         return result
     
     async def delete_resource(self, endpoint: str, resource_id: Union[int, str]) -> bool:
         try:
             url = f"{self.base_url}/{endpoint.lstrip('/')}/{resource_id}"
-            await self.fetch_with_retry(url, method='DELETE')
-            return True
+            result = await self.fetch_with_retry(url, method='DELETE')
+            return result is not None
         except APIError as e:
             logger.error(f"Delete failed: {e}")
             return False
@@ -245,10 +297,11 @@ class AsyncAPIClient(Generic[T]):
             'error_count': self.metrics.error_count,
             'average_duration': self.metrics.get_average_duration(),
             'success_rate': self.metrics.get_success_rate(),
-            'circuit_breaker_state': self.circuit_breaker.state
+            'circuit_breaker_state': self.circuit_breaker.state,
+            'status_code_distribution': self.metrics.get_status_code_distribution()
         }
 
-async def fetch_data(session, url):
+async def fetch_data(session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(url) as response:
             if response.status == 200:
@@ -258,7 +311,7 @@ async def fetch_data(session, url):
         logger.error(f"Error fetching {url}: {e}")
         return None
 
-async def fetch_posts_with_comments():
+async def fetch_posts_with_comments() -> List[Dict[str, Any]]:
     config = ClientConfig(base_url='https://jsonplaceholder.typicode.com')
     async with AsyncAPIClient(config) as client:
         post_endpoints = [f'posts/{i}' for i in range(1, 6)]
@@ -280,7 +333,7 @@ async def fetch_posts_with_comments():
         
         return valid_posts
 
-async def demonstrate_crud_operations():
+async def demonstrate_crud_operations() -> None:
     try:
         config = ClientConfig(base_url='https://jsonplaceholder.typicode.com')
         async with AsyncAPIClient(config) as client:
@@ -327,14 +380,14 @@ async def demonstrate_crud_operations():
     except Exception as e:
         print(f"CRUD operations failed: {e}")
 
-async def fetch_with_rate_limiting():
+async def fetch_with_rate_limiting() -> None:
     try:
         config = ClientConfig(
             base_url='https://jsonplaceholder.typicode.com',
             rate_limit=3
         )
         async with AsyncAPIClient(config) as client:
-            async def fetch_with_limit(i):
+            async def fetch_with_limit(i: int) -> Optional[Dict[str, Any]]:
                 try:
                     return await client.fetch_with_retry(f'{client.base_url}/posts/{i}')
                 except APIError as e:
@@ -349,7 +402,7 @@ async def fetch_with_rate_limiting():
     except Exception as e:
         print(f"Rate limiting demo failed: {e}")
 
-async def stream_large_response():
+async def stream_large_response() -> None:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get('https://jsonplaceholder.typicode.com/posts', 
@@ -370,14 +423,14 @@ async def stream_large_response():
     except Exception as e:
         print(f"\n=== Streaming Response Failed: {e} ===")
 
-async def interceptor_example(url: str, kwargs: Dict) -> tuple:
+async def interceptor_example(url: str, kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     logger.info(f"Request to {url}")
     if 'params' not in kwargs:
         kwargs['params'] = {}
     kwargs['params']['_t'] = datetime.now().timestamp()
     return url, kwargs
 
-async def main():
+async def main() -> None:
     print("=== Basic Concurrent Fetches ===")
     async with aiohttp.ClientSession() as session:
         tasks = [
